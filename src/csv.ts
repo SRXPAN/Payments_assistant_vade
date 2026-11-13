@@ -1,5 +1,5 @@
 // Экспорт в CSV для Excel: разделитель «;», BOM, чтобы кириллица открывалась без настройки.
-import { PERIOD_LABELS } from "./dates";
+import { periodLabel } from "./dates";
 import type { ExportLog, ExportPayment } from "./db";
 
 type Cell = string | number | null;
@@ -18,17 +18,35 @@ export function toCsv(headers: string[], rows: Cell[][]): string {
 
 export function paymentsCsv(rows: ExportPayment[]): string {
   return toCsv(
-    ["id", "Название", "Оплачено до", "Период", "Час напоминания", "Статус", "Создан (UTC)", "Изменён (UTC)", "Заметка"],
+    [
+      "id",
+      "Название",
+      "Оплачено до",
+      "Период",
+      "Час напоминания",
+      "Статус",
+      "Создан (UTC)",
+      "Изменён (UTC)",
+      "Заметка",
+      "Предупреждать за, дн.",
+      "Ответственный",
+      "Автосписание",
+      "Категория",
+    ],
     rows.map((p) => [
       p.id,
       p.name,
       p.due_date,
-      PERIOD_LABELS[p.period],
+      periodLabel(p.period, p.month_days),
       p.remind_hour === null ? "как в настройках" : `${p.remind_hour}:00`,
       p.deleted ? "удалён" : p.archived ? "архив" : "активен",
       p.created_at,
       p.updated_at,
       p.note,
+      p.warn_days === null ? "как в настройках" : p.warn_days,
+      p.responsible,
+      p.autopay ? "да" : "нет",
+      p.category,
     ]),
   );
 }

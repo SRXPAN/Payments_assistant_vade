@@ -8,7 +8,9 @@ import {
   listLine,
   localNow,
   parseDateInput,
+  parseMonthDays,
   paymentStatus,
+  periodLabel,
   shiftNote,
 } from "../src/dates";
 
@@ -32,6 +34,26 @@ describe("сдвиг на период", () => {
   });
   it("разово — следующего срока нет", () => {
     expect(addPeriod("2026-11-20", "once")).toBeNull();
+  });
+  it("дважды в месяц: 10 и 25 числа", () => {
+    expect(addPeriod("2026-11-10", "semimonthly", "10,25")).toBe("2026-11-25");
+    expect(addPeriod("2026-11-25", "semimonthly", "10,25")).toBe("2026-12-10");
+    expect(addPeriod("2026-12-25", "semimonthly", "10,25")).toBe("2027-01-10"); // через Новый год
+    expect(addPeriod("2026-11-17", "semimonthly", "10,25")).toBe("2026-11-25"); // срок сдвигали вручную
+  });
+  it("дважды в месяц: 15 и 31 — в коротком месяце последний день", () => {
+    expect(addPeriod("2027-02-15", "semimonthly", "15,31")).toBe("2027-02-28");
+    expect(addPeriod("2027-02-28", "semimonthly", "15,31")).toBe("2027-03-15");
+    expect(addPeriod("2027-03-15", "semimonthly", "15,31")).toBe("2027-03-31");
+  });
+  it("дважды в месяц без чисел считается как ежемесячный", () => {
+    expect(addPeriod("2026-11-10", "semimonthly", null)).toBe("2026-12-10");
+  });
+  it("числа месяца: разбор и подпись периода", () => {
+    expect(parseMonthDays("25,10")).toEqual([10, 25]);
+    for (const bad of ["10", "10,10", "0,5", "5,32", "a,b", "", null]) expect(parseMonthDays(bad)).toBeNull();
+    expect(periodLabel("semimonthly", "10,25")).toBe("дважды в месяц (10 и 25 числа)");
+    expect(periodLabel("monthly", "10,25")).toBe("ежемесячно");
   });
 });
 

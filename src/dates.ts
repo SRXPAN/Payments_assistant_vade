@@ -1,7 +1,7 @@
 // Логика дат без Telegram и без библиотек. Даты — строки YYYY-MM-DD, арифметика в UTC.
 
 export type ISODate = string;
-export type Period = "monthly" | "quarterly" | "yearly" | "biweekly" | "once";
+export type Period = "monthly" | "quarterly" | "yearly" | "biweekly" | "semimonthly" | "once";
 export type Color = "green" | "yellow" | "red";
 export type ShiftReason = "weekend" | "holiday" | null;
 
@@ -13,8 +13,24 @@ export const PERIOD_LABELS: Record<Period, string> = {
   quarterly: "раз в квартал",
   yearly: "ежегодно",
   biweekly: "каждые 2 недели",
+  semimonthly: "дважды в месяц",
   once: "разово",
 };
+
+/** «10,25» → [10, 25]; null, если это не два разных числа месяца. */
+export function parseMonthDays(value: string | null | undefined): [number, number] | null {
+  const days = (value ?? "").split(",").map(Number);
+  const [a, b] = days;
+  if (days.length !== 2 || a === undefined || b === undefined) return null;
+  const ok = (d: number) => Number.isInteger(d) && d >= 1 && d <= 31;
+  return ok(a) && ok(b) && a !== b ? [Math.min(a, b), Math.max(a, b)] : null;
+}
+
+/** Период словами; для «дважды в месяц» — с числами: «дважды в месяц (10 и 25 числа)». */
+export function periodLabel(period: Period, monthDays?: string | null): string {
+  const days = period === "semimonthly" ? parseMonthDays(monthDays) : null;
+  return days ? `${PERIOD_LABELS[period]} (${days[0]} и ${days[1]} числа)` : PERIOD_LABELS[period];
+}
 
 export const COLOR_EMOJI: Record<Color, string> = { green: "🟢", yellow: "🟡", red: "🔴" };
 
@@ -70,9 +86,29 @@ export function addMonths(iso: ISODate, n: number): ISODate {
   return fromYMD(ny, nm, Math.min(d, daysInMonth(ny, nm)));
 }
 
-/** Следующий срок после оплаты; для «разово» — null (платёж уходит в архив). */
-export function addPeriod(iso: ISODate, period: Period): ISODate | null {
+/** Ближайшая дата после `iso`, выпадающая на одно из двух чисел месяца (31 в коротком месяце — последний день). */
+export function nextMonthDay(iso: ISODate, days: [number, number]): ISODate {
+  const [y, m] = parts(iso);
+  const candidates: ISODate[] = [];
+  for (let offset = 0; offset <= 1; offset++) {
+    const total = y * 12 + (m - 1) + offset;
+    const cy = Math.floor(total / 12);
+    const cm = (total % 12) + 1;
+    for (const d of days) candidates.push(fromYMD(cy, cm, Math.min(d, daysInMonth(cy, cm))));
+  }
+  return candidates.filter((c) => c > iso).sort()[0]!;
+}
+
+/**
+ * Следующий срок после оплаты; для «разово» — null (платёж уходит в архив).
+ * monthDays нужен только периоду «дважды в месяц»; без него он считается как ежемесячный.
+ */
+export function addPeriod(iso: ISODate, period: Period, monthDays?: string | null): ISODate | null {
   switch (period) {
+    case "semimonthly": {
+      const days = parseMonthDays(monthDays);
+      return days ? nextMonthDay(iso, days) : addMonths(iso, 1);
+    }
     case "monthly":
       return addMonths(iso, 1);
     case "quarterly":
@@ -154,8 +190,12 @@ export interface PaymentStatus {
   color: Color;
 }
 
-export function paymentStatus(due: ISODate, today: ISODate, warnDays: number): PaymentStatus {
-  const { date, reason } = effectiveDeadline(due);
+/**
+ * shift = false — для автосписаний: карта списывается в саму дату, даже в выходной,
+ * поэтому срок на рабочий день не переносится.
+ */
+export function paymentStatus(due: ISODate, today: ISODate, warnDays: number, shift = true): PaymentStatus {
+  const { date, reason } = shift ? effectiveDeadline(due) : { date: due, reason: null };
   const days = diffDays(today, date);
   const color: Color = days < 0 ? "red" : days <= warnDays ? "yellow" : "green";
   return { deadline: date, reason, days, color };
@@ -192,9 +232,9 @@ export function shiftNote(status: PaymentStatus): string {
 }
 
 /** Строка списка: «• Название — 20.11.2026 🟢 через 8 дн.» */
-export function listLine(name: string, due: ISODate, today: ISODate, warnDays: number): string {
-  const st = paymentStatus(due, today, warnDays);
-  const note = shiftNote(st);
+export function listLine(name: string, due: ISODate, today: ISODate, warnDays: number, autopay = false): string {
+  const st = paymentStatus(due, today, warnDays, !autopay);
+  const note = autopay ? "💳 авто" : shiftNote(st);
   return `• ${name} — ${formatDate(due)} ${COLOR_EMOJI[st.color]} ${daysLabel(st.days)}${note ? ` ${note}` : ""}`;
 }
 

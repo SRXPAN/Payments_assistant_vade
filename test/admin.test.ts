@@ -8,7 +8,8 @@ describe("справка", () => {
   it("наблюдателю — только про список и статусы", () => {
     const text = helpText("viewer", 4);
     expect(text).toContain("📋 Список");
-    expect(text).toContain("🟡 — осталось 4 дн. или меньше");
+    expect(text).toContain("🟢 — до срока больше 4 дн.");
+    expect(text).toContain("🔎 Поиск");
     expect(text).toContain("наблюдатель");
     expect(text).not.toContain("➕ Добавить");
     expect(text).not.toContain("👥 Доступ");
@@ -56,6 +57,7 @@ describe("настройки", () => {
       ["9:00", "s:hour:9"],
       ["10:00", "s:hour:10"],
       ["✅ 12:00", "s:hour:12"],
+      ["🔕 Выходные: не беспокоить", "s:quiet"],
       ["🧪 Проверить сейчас", "s:test"],
       ["📤 Экспорт CSV", "s:csv"],
       ["🗑 Корзина", "s:trash"],
@@ -80,6 +82,15 @@ describe("настройки", () => {
     expect(labels).toContain("Отвязать группу");
     expect(labels).toContain("✅ 7 дн.");
     expect(labels).toContain("✅ 9:00");
+    expect(labels).not.toContain("Сбросить тему");
+  });
+  it("выбранная тема группы и выключенный тихий режим", () => {
+    const view = settingsView({ group_chat_id: "-100123", group_title: "Клуб", group_thread_id: "7", quiet_weekends: "0" });
+    expect(view.text).toContain("Группа: Клуб, пишу в выбранную тему");
+    expect(view.text).toContain("напоминаю как обычно");
+    const labels = buttons(view).map(([text]) => text);
+    expect(labels).toContain("Сбросить тему");
+    expect(labels).toContain("🔔 Выходные: напоминать");
   });
 });
 
@@ -137,8 +148,13 @@ describe("CSV", () => {
         id: 1,
         name: "Интернет",
         due_date: "2026-12-12",
-        period: "monthly",
+        period: "semimonthly",
+        month_days: "10,25",
         remind_hour: 9,
+        warn_days: 7,
+        responsible: "Сеня",
+        autopay: 1,
+        category: "Подписки",
         note: "Договор 15; платит Сеня",
         archived: 0,
         deleted: 0,
@@ -150,7 +166,12 @@ describe("CSV", () => {
         name: "Ремонт",
         due_date: "2026-11-20",
         period: "once",
+        month_days: null,
         remind_hour: null,
+        warn_days: null,
+        responsible: null,
+        autopay: 0,
+        category: null,
         note: null,
         archived: 1,
         deleted: 0,
@@ -161,9 +182,10 @@ describe("CSV", () => {
     const lines = csv.trim().split("\r\n");
     expect(lines).toHaveLength(3);
     expect(lines[1]).toBe(
-      '1;Интернет;2026-12-12;ежемесячно;9:00;активен;2026-11-01 10:00:00;2026-11-12 10:00:00;"Договор 15; платит Сеня"',
+      '1;Интернет;2026-12-12;дважды в месяц (10 и 25 числа);9:00;активен;2026-11-01 10:00:00;2026-11-12 10:00:00;"Договор 15; платит Сеня";7;Сеня;да;Подписки',
     );
     expect(lines[2]).toContain(";разово;как в настройках;архив;");
+    expect(lines[2]!.endsWith(";как в настройках;;нет;")).toBe(true);
   });
   it("журнал: кто, действие, старая и новая дата", () => {
     const csv = logCsv([

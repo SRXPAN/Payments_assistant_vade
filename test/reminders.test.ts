@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { addPeriod } from "../src/dates";
 import {
+  autopayNextDue,
+  weekPlan,
   overdueDigest,
   planReminders,
   type PlanOptions,
@@ -96,6 +98,74 @@ describe("еженедельная сводка давно просроченн�
   });
   it("нет давно просроченных — сводки нет", () => {
     expect(overdueDigest([pay(2, "2026-11-10"), pay(3, "2026-11-20")], "2026-11-13")).toBeNull();
+  });
+});
+
+describe("план на неделю", () => {
+  it("платежи с понедельника по воскресенье, по дням, со сдвигом выходных", () => {
+    const plan = weekPlan(
+      [
+        pay(1, "2026-11-18"), // среда
+        pay(2, "2026-11-22"), // воскресенье → платить в пятницу 20.11
+        pay(3, "2026-11-21", { autopay: 1 }), // суббота, автосписание — в саму дату
+        pay(4, "2026-11-23"), // следующий понедельник — уже не эта неделя
+        pay(5, "2026-11-10"), // просрочен — не в плане
+      ],
+      "2026-11-16", // понедельник
+    );
+    expect(plan).toEqual([
+      "🗓 На этой неделе платим (3):",
+      "• ср 18.11 — Платёж 1",
+      "• пт 20.11 — Платёж 2 (срок 22.11, вс)",
+      "• сб 21.11 — Платёж 3 💳 авто",
+    ]);
+  });
+  it("на неделе платить нечего — плана нет", () => {
+    expect(weekPlan([pay(4, "2026-11-30")], "2026-11-16")).toBeNull();
+  });
+});
+
+describe("автосписание", () => {
+  it("напоминает проверить баланс; срок в выходной не переносится", () => {
+    // 15.11.2026 — воскресенье.
+    expect(reminderText("Хостинг", "2026-11-15", "2026-11-13", N, true)).toBe(
+      "💳 Через 2 дн. автосписание: Хостинг — 15.11.2026. Проверьте, что на карте есть деньги.",
+    );
+    expect(reminderText("Хостинг", "2026-11-15", "2026-11-14", N, true)).toContain("💳 Завтра автосписание");
+    expect(reminderText("Хостинг", "2026-11-15", "2026-11-15", N, true)).toContain("💳 Сегодня автосписание");
+    expect(reminderText("Хостинг", "2026-11-15", "2026-11-16", N, true)).toBeNull(); // «просрочки» не бывает
+  });
+  it("после даты срок сдвигается сам, а до и в саму дату — нет", () => {
+    const p = { due_date: "2026-11-15", period: "monthly" as const };
+    expect(autopayNextDue(p, "2026-11-14")).toBeUndefined();
+    expect(autopayNextDue(p, "2026-11-15")).toBeUndefined();
+    expect(autopayNextDue(p, "2026-11-16")).toBe("2026-12-15");
+  });
+  it("бот не работал три месяца — догоняет до ближайшей будущей даты", () => {
+    expect(autopayNextDue({ due_date: "2026-08-15", period: "monthly" }, "2026-11-16")).toBe("2026-12-15");
+  });
+  it("разовое автосписание после даты уходит в архив", () => {
+    expect(autopayNextDue({ due_date: "2026-11-15", period: "once" }, "2026-11-16")).toBeNull();
+  });
+});
+
+describe("свой запас дней и тихие выходные", () => {
+  it("свой запас дней платежа важнее общего", () => {
+    // До срока 20.11 от пятницы 13.11 — 7 дней.
+    expect(planReminders([pay(1, "2026-11-20")], opts())).toEqual([]);
+    expect(planReminders([pay(1, "2026-11-20", { warn_days: 7 })], opts())).toHaveLength(1);
+    expect(planReminders([pay(1, "2026-11-16", { warn_days: 1 })], opts())).toEqual([]); // 3 дня, а ждём 1
+  });
+  it("в выходной обычные платежи молчат, автосписания — нет", () => {
+    const payments = [pay(1, "2026-11-16"), pay(2, "2026-11-16", { autopay: 1 })];
+    const saturday = opts({ today: "2026-11-14", quiet: true });
+    expect(planReminders(payments, saturday).map((r) => r.payment.id)).toEqual([2]);
+    expect(planReminders(payments, { ...saturday, quiet: false }).map((r) => r.payment.id)).toEqual([1, 2]);
+  });
+  it("в праздник в будний день тоже тихо, в рабочий день — как обычно", () => {
+    // 11.11.2026 — среда, праздник; срок 12.11 — «завтра».
+    expect(planReminders([pay(1, "2026-11-12")], opts({ today: "2026-11-11", quiet: true }))).toEqual([]);
+    expect(planReminders([pay(1, "2026-11-13")], opts({ today: "2026-11-12", quiet: true }))).toHaveLength(1);
   });
 });
 

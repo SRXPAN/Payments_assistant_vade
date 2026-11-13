@@ -1,7 +1,0 @@
-# Скопируйте в .dev.vars (файл в .gitignore) — это значения для локального запуска `npm run dev`.
-# На Cloudflare секреты задаются командами `npx wrangler secret put BOT_TOKEN` и `... WEBHOOK_SECRET`.
-BOT_TOKEN=123456:токен-от-BotFather
-WEBHOOK_SECRET=любая-длинная-строка-из-латиницы-и-цифр
-OWNER_ID=123456789
-# Адрес воркера — нужен командам npm run bot:setup / bot:status / bot:check
-WORKER_URL=https://club-payments-bot.ваш-аккаунт.workers.dev

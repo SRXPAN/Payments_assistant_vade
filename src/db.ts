@@ -79,7 +79,12 @@ export interface ExportPayment {
   name: string;
   due_date: ISODate;
   period: Period;
+  month_days: string | null;
   remind_hour: number | null;
+  warn_days: number | null;
+  responsible: string | null;
+  autopay: number;
+  category: string | null;
   note: string | null;
   archived: number;
   deleted: number;
@@ -106,8 +111,11 @@ export interface ExportLog {
 export async function exportPayments(db: D1Database): Promise<ExportPayment[]> {
   const res = await db
     .prepare(
-      `SELECT id, name, due_date, period, remind_hour, note, archived, deleted, created_at, updated_at
-       FROM payments ORDER BY deleted, archived, due_date, name`,
+      `SELECT p.id, p.name, p.due_date, p.period, p.month_days, p.remind_hour, p.warn_days,
+              CASE WHEN p.responsible_id IS NULL THEN NULL
+                   ELSE COALESCE(u.name, 'id ' || p.responsible_id) END AS responsible, p.autopay, p.category, p.note, p.archived, p.deleted, p.created_at, p.updated_at
+       FROM payments p LEFT JOIN users u ON u.id = p.responsible_id
+       ORDER BY p.deleted, p.archived, p.due_date, p.name`,
     )
     .all<ExportPayment>();
   return res.results;
@@ -192,11 +200,21 @@ export interface Payment {
   name: string;
   due_date: ISODate;
   period: Period;
+  /** Для периода «дважды в месяц»: два числа, например «10,25». */
+  month_days: string | null;
   remind_hour: number | null;
+  /** Свой запас дней до срока; null — общий из настроек. */
+  warn_days: number | null;
+  /** Telegram id ответственного. */
+  responsible_id: number | null;
+  /** 1 — списывается с карты само. */
+  autopay: number;
+  category: string | null;
   note: string | null;
 }
 
-const COLS = "id, name, due_date, period, remind_hour, note";
+const COLS =
+  "id, name, due_date, period, month_days, remind_hour, warn_days, responsible_id, autopay, category, note";
 const ACTIVE = "archived = 0 AND deleted = 0";
 
 /** Активные платежи по сроку, ближайшие сверху. */
@@ -211,17 +229,50 @@ export function getPayment(db: D1Database, id: number): Promise<Payment | null> 
   return db.prepare(`SELECT ${COLS} FROM payments WHERE id = ? AND ${ACTIVE}`).bind(id).first<Payment>();
 }
 
-export async function createPayment(
+export interface NewPayment {
+  name: string;
+  date: ISODate;
+  period: Period;
+  monthDays?: string | null;
+}
+
+/** Добавляет один или несколько платежей одной транзакцией. */
+export async function createPayments(db: D1Database, items: NewPayment[], userId: number): Promise<void> {
+  if (items.length === 0) return;
+  const insert = db.prepare(
+    "INSERT INTO payments (name, due_date, period, month_days, created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  await db.batch(items.map((i) => insert.bind(i.name, i.date, i.period, i.monthDays ?? null, userId, userId)));
+}
+
+/** Период меняется вместе с числами месяца: они нужны только периоду «дважды в месяц». */
+export async function updatePeriod(
   db: D1Database,
-  name: string,
-  due: ISODate,
+  id: number,
   period: Period,
+  monthDays: string | null,
   userId: number,
 ): Promise<void> {
   await db
-    .prepare("INSERT INTO payments (name, due_date, period, created_by, updated_by) VALUES (?, ?, ?, ?, ?)")
-    .bind(name, due, period, userId, userId)
+    .prepare("UPDATE payments SET period = ?, month_days = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(period, monthDays, userId, id)
     .run();
+}
+
+export interface Person {
+  name: string;
+  username: string | null;
+}
+
+/** Все, кого можно назначить ответственным: владелец и люди с доступом. */
+export async function listPeople(db: D1Database, ownerId: number): Promise<Map<number, Person>> {
+  const [users, settings] = await Promise.all([listUsers(db), getSettings(db)]);
+  const people = new Map<number, Person>();
+  people.set(ownerId, { name: settings.owner_name || "Владелец", username: settings.owner_username || null });
+  for (const u of users) {
+    if (u.role === "admin" || u.role === "viewer") people.set(u.id, { name: u.name, username: u.username });
+  }
+  return people;
 }
 
 /**
@@ -283,7 +334,8 @@ export async function undoLastPayment(db: D1Database, paymentId: number, actor: 
   if (res.meta.changes === 0) return null;
   await db.prepare("UPDATE payments_log SET undone = 1 WHERE id = ?").bind(last.id).run();
   await addLog(db, p.id, actor, "undo", last.new_date, last.old_date);
-  return { id: p.id, name: p.name, due_date: last.old_date, period: p.period, remind_hour: p.remind_hour, note: p.note };
+  const { archived: _archived, ...payment } = p;
+  return { ...payment, due_date: last.old_date };
 }
 
 // ---------- Корзина: удалённые и архивные платежи ----------
@@ -321,11 +373,11 @@ export async function restorePayment(db: D1Database, id: number, actor: Actor): 
   return item;
 }
 
-/** Меняет одно поле платежа: название, период, час напоминания или заметку. */
+/** Меняет одно поле платежа. Имя поля подставляется в SQL, поэтому список полей закрытый. */
 export async function updatePaymentField(
   db: D1Database,
   id: number,
-  field: "name" | "period" | "remind_hour" | "note",
+  field: "name" | "remind_hour" | "note" | "warn_days" | "responsible_id" | "autopay" | "category",
   value: string | number | null,
   userId: number,
 ): Promise<void> {
@@ -396,6 +448,8 @@ export type FsmState =
   | "add:dup"
   | "add:date"
   | "add:period"
+  | "add:day"
+  | "add:bulk"
   | "edit:date"
   | "edit:name"
   | "edit:note";
@@ -403,7 +457,15 @@ export type FsmState =
 export interface Fsm {
   state: FsmState;
   /** promptId — сообщение бота в группе, на которое ждём ответ с датой; remId — само напоминание. */
-  data: { name?: string; date?: ISODate; id?: number; promptId?: number; remId?: number };
+  data: {
+    name?: string;
+    date?: ISODate;
+    period?: Period;
+    id?: number;
+    promptId?: number;
+    remId?: number;
+    threadId?: number;
+  };
 }
 
 export async function getState(db: D1Database, chatId: number, userId: number): Promise<Fsm | null> {
