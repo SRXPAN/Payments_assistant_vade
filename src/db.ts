@@ -1,0 +1,436 @@
+import { effectiveDeadline, type ISODate, type Period } from "./dates";
+
+export type StoredRole = "admin" | "viewer" | "pending" | "rejected";
+export type Role = "owner" | "admin" | "viewer";
+
+export interface UserRow {
+  id: number;
+  name: string;
+  username: string | null;
+  role: StoredRole;
+}
+
+/** Кто выполняет действие: id и имя из Telegram на этот момент. */
+export interface Actor {
+  id: number;
+  name: string;
+}
+
+// ---------- Пользователи ----------
+
+export function getUser(db: D1Database, id: number): Promise<UserRow | null> {
+  return db.prepare("SELECT id, name, username, role FROM users WHERE id = ?").bind(id).first<UserRow>();
+}
+
+/** Роль с доступом или null (нет записи, запрос ждёт решения или отклонён). */
+export async function getRole(db: D1Database, ownerId: number, userId: number): Promise<Role | null> {
+  if (userId === ownerId) return "owner";
+  const user = await getUser(db, userId);
+  return user && (user.role === "admin" || user.role === "viewer") ? user.role : null;
+}
+
+export async function saveAccessRequest(
+  db: D1Database,
+  id: number,
+  name: string,
+  username: string | null,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO users (id, name, username, role) VALUES (?, ?, ?, 'pending')
+       ON CONFLICT (id) DO UPDATE SET name = excluded.name, username = excluded.username,
+         role = 'pending', updated_at = datetime('now')`,
+    )
+    .bind(id, name, username)
+    .run();
+}
+
+/** Возвращает false, если пользователя нет в таблице. */
+export async function setUserRole(db: D1Database, id: number, role: StoredRole): Promise<boolean> {
+  const res = await db
+    .prepare("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(role, id)
+    .run();
+  return res.meta.changes > 0;
+}
+
+/** Все: кто ждёт решения, у кого есть доступ и кому отказано. */
+export async function listUsers(db: D1Database): Promise<UserRow[]> {
+  const res = await db
+    .prepare(
+      `SELECT id, name, username, role FROM users
+       ORDER BY CASE role WHEN 'pending' THEN 0 WHEN 'admin' THEN 1 WHEN 'viewer' THEN 2 ELSE 3 END, name`,
+    )
+    .all<UserRow>();
+  return res.results;
+}
+
+export async function deleteUser(db: D1Database, id: number): Promise<void> {
+  await db.batch([
+    db.prepare("DELETE FROM users WHERE id = ?").bind(id),
+    db.prepare("DELETE FROM fsm WHERE user_id = ?").bind(id),
+  ]);
+}
+
+// ---------- Экспорт ----------
+
+export interface ExportPayment {
+  id: number;
+  name: string;
+  due_date: ISODate;
+  period: Period;
+  remind_hour: number | null;
+  note: string | null;
+  archived: number;
+  deleted: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export type LogAction = "paid" | "edit_date" | "delete" | "undo" | "restore";
+
+export interface ExportLog {
+  id: number;
+  payment_id: number;
+  name: string;
+  user_name: string;
+  user_id: number;
+  action: LogAction;
+  old_date: ISODate | null;
+  new_date: ISODate | null;
+  undone: number;
+  created_at: string;
+}
+
+/** Все платежи, включая архивные и удалённые. */
+export async function exportPayments(db: D1Database): Promise<ExportPayment[]> {
+  const res = await db
+    .prepare(
+      `SELECT id, name, due_date, period, remind_hour, note, archived, deleted, created_at, updated_at
+       FROM payments ORDER BY deleted, archived, due_date, name`,
+    )
+    .all<ExportPayment>();
+  return res.results;
+}
+
+export async function exportLog(db: D1Database): Promise<ExportLog[]> {
+  const res = await db
+    .prepare(
+      `SELECT l.id, l.payment_id, p.name, l.user_name, l.user_id, l.action, l.old_date, l.new_date, l.undone, l.created_at
+       FROM payments_log l JOIN payments p ON p.id = l.payment_id ORDER BY l.id`,
+    )
+    .all<ExportLog>();
+  return res.results;
+}
+
+// ---------- Настройки ----------
+
+export async function getSetting(db: D1Database, key: string): Promise<string | null> {
+  const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+export async function getSettings(db: D1Database): Promise<Record<string, string | undefined>> {
+  const res = await db.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
+  return Object.fromEntries(res.results.map((r) => [r.key, r.value]));
+}
+
+export async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
+  await db
+    .prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value")
+    .bind(key, value)
+    .run();
+}
+
+export async function deleteSetting(db: D1Database, key: string): Promise<void> {
+  await db.prepare("DELETE FROM settings WHERE key = ?").bind(key).run();
+}
+
+// ---------- Отправленные напоминания ----------
+
+/** Ключи «платёж:срок» напоминаний, уже отправленных в этот день. */
+export async function getSentKeys(db: D1Database, remindDate: ISODate): Promise<Set<string>> {
+  const res = await db
+    .prepare("SELECT payment_id, due_date FROM sent_reminders WHERE remind_date = ?")
+    .bind(remindDate)
+    .all<{ payment_id: number; due_date: string }>();
+  return new Set(res.results.map((r) => `${r.payment_id}:${r.due_date}`));
+}
+
+export async function recordSent(
+  db: D1Database,
+  paymentId: number,
+  due: ISODate,
+  remindDate: ISODate,
+  chatId: number,
+  messageId: number,
+): Promise<void> {
+  await db
+    .prepare(
+      "INSERT OR REPLACE INTO sent_reminders (payment_id, due_date, remind_date, chat_id, message_id) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(paymentId, due, remindDate, chatId, messageId)
+    .run();
+}
+
+/** Уборка: старые записи об отправке и брошенный пошаговый ввод больше не нужны. */
+export async function cleanup(db: D1Database, today: ISODate): Promise<void> {
+  await db.batch([
+    db.prepare("DELETE FROM sent_reminders WHERE remind_date < date(?, '-60 days')").bind(today),
+    db.prepare("DELETE FROM fsm WHERE updated_at < datetime('now', '-7 days')"),
+  ]);
+}
+
+export async function getWarnDays(db: D1Database): Promise<number> {
+  return Number(await getSetting(db, "warn_days")) || 4;
+}
+
+// ---------- Платежи ----------
+
+export interface Payment {
+  id: number;
+  name: string;
+  due_date: ISODate;
+  period: Period;
+  remind_hour: number | null;
+  note: string | null;
+}
+
+const COLS = "id, name, due_date, period, remind_hour, note";
+const ACTIVE = "archived = 0 AND deleted = 0";
+
+/** Активные платежи по сроку, ближайшие сверху. */
+export async function listPayments(db: D1Database): Promise<Payment[]> {
+  const res = await db.prepare(`SELECT ${COLS} FROM payments WHERE ${ACTIVE} ORDER BY due_date, name`).all<Payment>();
+  // Срок на выходной считается от предыдущего рабочего дня — сортируем по нему же.
+  const key = new Map(res.results.map((p) => [p.id, effectiveDeadline(p.due_date).date]));
+  return res.results.sort((a, b) => key.get(a.id)!.localeCompare(key.get(b.id)!));
+}
+
+export function getPayment(db: D1Database, id: number): Promise<Payment | null> {
+  return db.prepare(`SELECT ${COLS} FROM payments WHERE id = ? AND ${ACTIVE}`).bind(id).first<Payment>();
+}
+
+export async function createPayment(
+  db: D1Database,
+  name: string,
+  due: ISODate,
+  period: Period,
+  userId: number,
+): Promise<void> {
+  await db
+    .prepare("INSERT INTO payments (name, due_date, period, created_by, updated_by) VALUES (?, ?, ?, ?, ?)")
+    .bind(name, due, period, userId, userId)
+    .run();
+}
+
+/**
+ * Меняет срок и пишет в журнал. newDate = null — разовый платёж оплачен, уходит в архив.
+ * Условие по старой дате защищает от двойного нажатия: вернёт false, если срок уже другой.
+ */
+export async function changeDueDate(
+  db: D1Database,
+  p: Payment,
+  newDate: ISODate | null,
+  actor: Actor,
+  action: "paid" | "edit_date",
+): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE payments SET due_date = ?, archived = ?, updated_by = ?, updated_at = datetime('now')
+       WHERE id = ? AND due_date = ? AND ${ACTIVE}`,
+    )
+    .bind(newDate ?? p.due_date, newDate ? 0 : 1, actor.id, p.id, p.due_date)
+    .run();
+  if (res.meta.changes === 0) return false;
+  await addLog(db, p.id, actor, action, p.due_date, newDate);
+  return true;
+}
+
+export async function deletePayment(db: D1Database, p: Payment, actor: Actor): Promise<void> {
+  await db
+    .prepare("UPDATE payments SET deleted = 1, updated_by = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(actor.id, p.id)
+    .run();
+  await addLog(db, p.id, actor, "delete", p.due_date, null);
+}
+
+/**
+ * Отменяет последнюю отметку об оплате: срок возвращается к прежнему, разовый платёж — из архива.
+ * Работает, только если после оплаты с платежом больше ничего не делали. Возвращает платёж
+ * в восстановленном виде или null, если отменять нечего.
+ */
+export async function undoLastPayment(db: D1Database, paymentId: number, actor: Actor): Promise<Payment | null> {
+  const p = await db
+    .prepare(`SELECT ${COLS}, archived FROM payments WHERE id = ? AND deleted = 0`)
+    .bind(paymentId)
+    .first<Payment & { archived: number }>();
+  const last = await db
+    .prepare("SELECT id, action, old_date, new_date, undone FROM payments_log WHERE payment_id = ? ORDER BY id DESC LIMIT 1")
+    .bind(paymentId)
+    .first<{ id: number; action: LogAction; old_date: ISODate | null; new_date: ISODate | null; undone: number }>();
+  if (!p || !last || last.action !== "paid" || last.undone || !last.old_date) return null;
+  const consistent = last.new_date === null ? p.archived === 1 : p.archived === 0 && last.new_date === p.due_date;
+  if (!consistent) return null;
+
+  const res = await db
+    .prepare(
+      `UPDATE payments SET due_date = ?, archived = 0, updated_by = ?, updated_at = datetime('now')
+       WHERE id = ? AND due_date = ? AND deleted = 0`,
+    )
+    .bind(last.old_date, actor.id, p.id, p.due_date)
+    .run();
+  if (res.meta.changes === 0) return null;
+  await db.prepare("UPDATE payments_log SET undone = 1 WHERE id = ?").bind(last.id).run();
+  await addLog(db, p.id, actor, "undo", last.new_date, last.old_date);
+  return { id: p.id, name: p.name, due_date: last.old_date, period: p.period, remind_hour: p.remind_hour, note: p.note };
+}
+
+// ---------- Корзина: удалённые и архивные платежи ----------
+
+export interface TrashItem {
+  id: number;
+  name: string;
+  due_date: ISODate;
+  archived: number;
+  deleted: number;
+}
+
+export async function listTrash(db: D1Database): Promise<TrashItem[]> {
+  const res = await db
+    .prepare(
+      `SELECT id, name, due_date, archived, deleted FROM payments
+       WHERE archived = 1 OR deleted = 1 ORDER BY updated_at DESC LIMIT 30`,
+    )
+    .all<TrashItem>();
+  return res.results;
+}
+
+/** Возвращает платёж в список. false — такого в корзине нет. */
+export async function restorePayment(db: D1Database, id: number, actor: Actor): Promise<TrashItem | null> {
+  const item = await db
+    .prepare("SELECT id, name, due_date, archived, deleted FROM payments WHERE id = ? AND (archived = 1 OR deleted = 1)")
+    .bind(id)
+    .first<TrashItem>();
+  if (!item) return null;
+  await db
+    .prepare("UPDATE payments SET archived = 0, deleted = 0, updated_by = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(actor.id, id)
+    .run();
+  await addLog(db, id, actor, "restore", null, item.due_date);
+  return item;
+}
+
+/** Меняет одно поле платежа: название, период, час напоминания или заметку. */
+export async function updatePaymentField(
+  db: D1Database,
+  id: number,
+  field: "name" | "period" | "remind_hour" | "note",
+  value: string | number | null,
+  userId: number,
+): Promise<void> {
+  await db
+    .prepare(`UPDATE payments SET ${field} = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ?`)
+    .bind(value, userId, id)
+    .run();
+}
+
+async function addLog(
+  db: D1Database,
+  paymentId: number,
+  actor: Actor,
+  action: LogAction,
+  oldDate: ISODate | null,
+  newDate: ISODate | null,
+): Promise<void> {
+  await db
+    .prepare(
+      "INSERT INTO payments_log (payment_id, user_id, user_name, action, old_date, new_date) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(paymentId, actor.id, actor.name, action, oldDate, newDate)
+    .run();
+}
+
+export interface LastPaid {
+  user_name: string;
+  /** UTC, формат SQLite: YYYY-MM-DD HH:MM:SS */
+  created_at: string;
+}
+
+/** Последняя оплата, которую не отменили. */
+export function getLastPaid(db: D1Database, paymentId: number): Promise<LastPaid | null> {
+  return db
+    .prepare(
+      `SELECT user_name, created_at FROM payments_log
+       WHERE payment_id = ? AND action = 'paid' AND undone = 0 ORDER BY id DESC LIMIT 1`,
+    )
+    .bind(paymentId)
+    .first<LastPaid>();
+}
+
+export interface HistoryItem {
+  user_name: string;
+  action: LogAction;
+  old_date: ISODate | null;
+  new_date: ISODate | null;
+  undone: number;
+  created_at: string;
+}
+
+/** Последние записи журнала по платежу, новые сверху. */
+export async function getHistory(db: D1Database, paymentId: number, limit = 5): Promise<HistoryItem[]> {
+  const res = await db
+    .prepare(
+      `SELECT user_name, action, old_date, new_date, undone, created_at FROM payments_log
+       WHERE payment_id = ? ORDER BY id DESC LIMIT ?`,
+    )
+    .bind(paymentId, limit)
+    .all<HistoryItem>();
+  return res.results;
+}
+
+// ---------- Состояние пошагового ввода ----------
+
+export type FsmState =
+  | "add:name"
+  | "add:dup"
+  | "add:date"
+  | "add:period"
+  | "edit:date"
+  | "edit:name"
+  | "edit:note";
+
+export interface Fsm {
+  state: FsmState;
+  /** promptId — сообщение бота в группе, на которое ждём ответ с датой; remId — само напоминание. */
+  data: { name?: string; date?: ISODate; id?: number; promptId?: number; remId?: number };
+}
+
+export async function getState(db: D1Database, chatId: number, userId: number): Promise<Fsm | null> {
+  const row = await db
+    .prepare("SELECT state, data FROM fsm WHERE chat_id = ? AND user_id = ?")
+    .bind(chatId, userId)
+    .first<{ state: FsmState; data: string }>();
+  return row ? { state: row.state, data: JSON.parse(row.data) } : null;
+}
+
+export async function setState(
+  db: D1Database,
+  chatId: number,
+  userId: number,
+  state: FsmState,
+  data: Fsm["data"] = {},
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO fsm (chat_id, user_id, state, data) VALUES (?, ?, ?, ?)
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET state = excluded.state, data = excluded.data,
+         updated_at = datetime('now')`,
+    )
+    .bind(chatId, userId, state, JSON.stringify(data))
+    .run();
+}
+
+export async function clearState(db: D1Database, chatId: number, userId: number): Promise<void> {
+  await db.prepare("DELETE FROM fsm WHERE chat_id = ? AND user_id = ?").bind(chatId, userId).run();
+}

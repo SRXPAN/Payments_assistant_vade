@@ -1,0 +1,28 @@
+name = "club-payments-bot"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+# Каждый час; нужный час по TZ проверяется в коде (см. SPEC.md).
+[triggers]
+crons = ["0 * * * *"]
+
+# Сохранять логи, чтобы их было видно в дашборде: Workers & Pages → club-payments-bot → Logs.
+[observability]
+enabled = true
+
+[vars]
+# Telegram ID владельца (число, строкой).
+OWNER_ID = "8769109427"
+TZ = "Europe/Warsaw"
+# JSON из ответа getMe — заполняется один раз, чтобы не вызывать getMe на каждый запрос.
+BOT_INFO = '{"id":9127077684,"is_bot":true,"first_name":"Payments_Assistant","username":"Club_Payments_Assistant_bot","can_join_groups":true,"can_read_all_group_messages":false,"supports_inline_queries":false,"supports_guest_queries":false,"can_connect_to_business":false,"has_main_web_app":false,"has_topics_enabled":false,"allows_users_to_create_topics":false,"can_manage_bots":false,"supports_join_request_queries":false}'
+
+# Секреты (в git не попадают):
+#   wrangler secret put BOT_TOKEN
+#   wrangler secret put WEBHOOK_SECRET
+
+[[d1_databases]]
+binding = "DB"
+database_name = "club-payments"
+database_id = "b2810af9-ea28-4854-b016-2753a1400cea"
+migrations_dir = "migrations"
