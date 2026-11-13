@@ -14,9 +14,10 @@ describe("справка", () => {
     expect(text).not.toContain("➕ Добавить");
     expect(text).not.toContain("👥 Доступ");
   });
-  it("админу — ещё про добавление, карточку и напоминания, но не про доступ", () => {
+  it("админу — ещё про добавление, карточку, напоминания и настройки, но не про доступ", () => {
     const text = helpText("admin", 7);
     expect(text).toContain("➕ Добавить");
+    expect(text).toContain("⚙️ Настройки");
     expect(text).toContain("↩️ Отменить оплату");
     expect(text).toContain("за 7 дн. до срока");
     expect(text).not.toContain("👥 Доступ");
@@ -107,15 +108,36 @@ describe("доступ", () => {
     const view = userCardView(user(1, "Сеня", "admin", "senya"));
     expect(view.text).toBe("Сеня (@senya, 1)\nРоль: админ");
     expect(buttons(view)).toEqual([
+      ["👑 Сделать владельцем", "u:own:1"],
       ["Сделать наблюдателем", "u:set:1:viewer"],
       ["Забрать доступ", "u:revoke:1"],
       ["↩️ Назад", "u:list"],
     ]);
   });
+  it("совладелец: роль меняет только главный владелец; свою карточку менять нельзя", () => {
+    const coOwner = user(5, "Влад", "owner");
+    expect(buttons(accessListView([coOwner]))).toEqual([["👑 Влад — владелец", "u:open:5"]]);
+
+    const forCoOwner = userCardView(coOwner);
+    expect(forCoOwner.text).toContain("может изменить только главный владелец");
+    expect(buttons(forCoOwner)).toEqual([["↩️ Назад", "u:list"]]);
+
+    expect(buttons(userCardView(coOwner, "", { manageOwner: true })).map(([text]) => text)).toEqual([
+      "Сделать админом",
+      "Сделать наблюдателем",
+      "Забрать доступ",
+      "↩️ Назад",
+    ]);
+
+    const self = userCardView(user(1, "Сеня", "admin"), "", { self: true });
+    expect(self.text).toContain("Это вы");
+    expect(buttons(self)).toEqual([["↩️ Назад", "u:list"]]);
+  });
   it("человек без доступа виден в списке; из карточки можно вернуть роль или снять блокировку", () => {
     const blocked = user(4, "Гость", "rejected");
     expect(buttons(accessListView([blocked]))).toEqual([["🚫 Гость — нет доступа", "u:open:4"]]);
     expect(buttons(userCardView(blocked))).toEqual([
+      ["👑 Сделать владельцем", "u:own:4"],
       ["Сделать админом", "u:set:4:admin"],
       ["Сделать наблюдателем", "u:set:4:viewer"],
       ["Удалить из списка", "u:forget:4"],
@@ -124,6 +146,7 @@ describe("доступ", () => {
   });
   it("карточка ожидающего: обе роли и «Отклонить»", () => {
     expect(buttons(userCardView(user(3, "Макс", "pending"))).map(([text]) => text)).toEqual([
+      "👑 Сделать владельцем",
       "Сделать админом",
       "Сделать наблюдателем",
       "Отклонить",

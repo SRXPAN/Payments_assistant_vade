@@ -11,7 +11,7 @@ const apply = (db: DatabaseSync, file: string) =>
 
 describe("миграции", () => {
   it("файлы идут по порядку номеров", () => {
-    expect(files).toEqual(["0001_init.sql", "0002_note_undo.sql", "0003_payment_options.sql"]);
+    expect(files).toEqual(["0001_init.sql", "0002_note_undo.sql", "0003_payment_options.sql", "0004_co_owners.sql"]);
   });
 
   it("данные и ссылки сохраняются на каждом шаге", () => {
@@ -28,6 +28,8 @@ describe("миграции", () => {
         VALUES (1, '2026-11-20', '2026-11-16', -100, 10);
     `);
 
+    db.exec("INSERT INTO users (id, name, username, role) VALUES (7, 'Сеня', 'senya', 'admin'), (8, 'Оля', NULL, 'rejected')");
+
     apply(db, files[1]!);
     expect(count("payments_log")).toBe(2);
     db.exec("UPDATE payments SET note = 'Договор 15' WHERE id = 1");
@@ -41,6 +43,15 @@ describe("миграции", () => {
       { id: 1, name: "Интернет", period: "monthly", remind_hour: 9, note: "Договор 15", autopay: 0, warn_days: null },
       { id: 5, name: "Ремонт", period: "once", remind_hour: null, note: null, autopay: 0, warn_days: null },
     ]);
+
+    // Люди и их роли переживают пересоздание таблицы; появляется роль «владелец».
+    apply(db, files[3]!);
+    expect(db.prepare("SELECT id, name, username, role FROM users ORDER BY id").all()).toEqual([
+      { id: 7, name: "Сеня", username: "senya", role: "admin" },
+      { id: 8, name: "Оля", username: null, role: "rejected" },
+    ]);
+    db.exec("UPDATE users SET role = 'owner' WHERE id = 7");
+    expect(() => db.exec("UPDATE users SET role = 'boss' WHERE id = 7")).toThrow(/CHECK/);
 
     // Новые платежи получают следующий id, новый период разрешён, ссылки по-прежнему проверяются.
     const next = db

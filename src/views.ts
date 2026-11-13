@@ -372,6 +372,7 @@ export function trashView(items: TrashItem[], note = ""): View {
 // ---------- 👥 Доступ ----------
 
 const USER_ROLE_LABELS: Record<UserRow["role"], string> = {
+  owner: "владелец",
   admin: "админ",
   viewer: "наблюдатель",
   pending: "ждёт решения",
@@ -385,27 +386,43 @@ export function userTitle(u: { name: string; username: string | null; id: number
 export function accessListView(users: UserRow[], note = ""): View {
   const keyboard = new InlineKeyboard();
   for (const u of users) {
-    const icon = u.role === "pending" ? "⏳ " : u.role === "rejected" ? "🚫 " : "";
+    const icon = u.role === "pending" ? "⏳ " : u.role === "rejected" ? "🚫 " : u.role === "owner" ? "👑 " : "";
     keyboard.text(`${icon}${truncate(u.name)} — ${USER_ROLE_LABELS[u.role]}`, `u:open:${u.id}`).row();
   }
   const body = users.length
-    ? "👥 Доступ\nВладелец — вы. Выберите человека, чтобы изменить роль:"
-    : "👥 Доступ\nВладелец — вы. Больше ни у кого доступа нет: человек должен нажать Start у бота, и вам придёт запрос.";
+    ? "👥 Доступ\nВыберите человека, чтобы изменить роль. 👑 — владельцы: они управляют доступом наравне с вами."
+    : "👥 Доступ\nБольше ни у кого доступа нет: человек должен нажать Start у бота, и вам придёт запрос.";
   return { text: withNote(note, body), keyboard };
 }
 
-export function userCardView(u: UserRow, note = ""): View {
+export interface UserCardOptions {
+  /** Смотрит главный владелец (из конфигурации): только он меняет роли других владельцев. */
+  manageOwner?: boolean;
+  /** Человек открыл собственную карточку. */
+  self?: boolean;
+}
+
+export function userCardView(u: UserRow, note = "", opts: UserCardOptions = {}): View {
   const keyboard = new InlineKeyboard();
-  if (u.role !== "admin") keyboard.text("Сделать админом", `u:set:${u.id}:admin`).row();
-  if (u.role !== "viewer") keyboard.text("Сделать наблюдателем", `u:set:${u.id}:viewer`).row();
-  if (u.role === "rejected") {
-    // «Удалить из списка» снимает блокировку: человек сможет снова отправить запрос.
-    keyboard.text("Удалить из списка", `u:forget:${u.id}`).row();
+  let body = `${userTitle(u)}\nРоль: ${USER_ROLE_LABELS[u.role]}`;
+  const locked = opts.self || (u.role === "owner" && !opts.manageOwner);
+  if (locked) {
+    body += opts.self
+      ? "\n\nЭто вы. Свою роль изменить нельзя."
+      : "\n\nРоль владельца может изменить только главный владелец.";
   } else {
-    keyboard.text(u.role === "pending" ? "Отклонить" : "Забрать доступ", `u:revoke:${u.id}`).row();
+    if (u.role !== "owner") keyboard.text("👑 Сделать владельцем", `u:own:${u.id}`).row();
+    if (u.role !== "admin") keyboard.text("Сделать админом", `u:set:${u.id}:admin`).row();
+    if (u.role !== "viewer") keyboard.text("Сделать наблюдателем", `u:set:${u.id}:viewer`).row();
+    if (u.role === "rejected") {
+      // «Удалить из списка» снимает блокировку: человек сможет снова отправить запрос.
+      keyboard.text("Удалить из списка", `u:forget:${u.id}`).row();
+    } else {
+      keyboard.text(u.role === "pending" ? "Отклонить" : "Забрать доступ", `u:revoke:${u.id}`).row();
+    }
   }
   keyboard.text(BACK, "u:list");
-  return { text: withNote(note, `${userTitle(u)}\nРоль: ${USER_ROLE_LABELS[u.role]}`), keyboard };
+  return { text: withNote(note, body), keyboard };
 }
 
 export function cancelKeyboard(data = "a:cancel"): InlineKeyboard {

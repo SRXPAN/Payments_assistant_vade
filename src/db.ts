@@ -1,6 +1,7 @@
 import { effectiveDeadline, type ISODate, type Period } from "./dates";
 
-export type StoredRole = "admin" | "viewer" | "pending" | "rejected";
+/** «owner» в таблице — совладелец; главный владелец задан в конфигурации и в таблице не хранится. */
+export type StoredRole = "owner" | "admin" | "viewer" | "pending" | "rejected";
 export type Role = "owner" | "admin" | "viewer";
 
 export interface UserRow {
@@ -23,10 +24,16 @@ export function getUser(db: D1Database, id: number): Promise<UserRow | null> {
 }
 
 /** Роль с доступом или null (нет записи, запрос ждёт решения или отклонён). */
-export async function getRole(db: D1Database, ownerId: number, userId: number): Promise<Role | null> {
-  if (userId === ownerId) return "owner";
+export async function getRole(db: D1Database, ownerIds: number[], userId: number): Promise<Role | null> {
+  if (ownerIds.includes(userId)) return "owner";
   const user = await getUser(db, userId);
-  return user && (user.role === "admin" || user.role === "viewer") ? user.role : null;
+  return user && (user.role === "owner" || user.role === "admin" || user.role === "viewer") ? user.role : null;
+}
+
+/** Все владельцы: из конфигурации и совладельцы из таблицы. Им приходят запросы доступа и уведомления. */
+export async function listOwnerIds(db: D1Database, ownerIds: number[]): Promise<number[]> {
+  const res = await db.prepare("SELECT id FROM users WHERE role = 'owner'").all<{ id: number }>();
+  return [...new Set([...ownerIds, ...res.results.map((r) => r.id)])];
 }
 
 export async function saveAccessRequest(
@@ -59,7 +66,7 @@ export async function listUsers(db: D1Database): Promise<UserRow[]> {
   const res = await db
     .prepare(
       `SELECT id, name, username, role FROM users
-       ORDER BY CASE role WHEN 'pending' THEN 0 WHEN 'admin' THEN 1 WHEN 'viewer' THEN 2 ELSE 3 END, name`,
+       ORDER BY CASE role WHEN 'pending' THEN 0 WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 WHEN 'viewer' THEN 3 ELSE 4 END, name`,
     )
     .all<UserRow>();
   return res.results;
@@ -270,7 +277,7 @@ export async function listPeople(db: D1Database, ownerId: number): Promise<Map<n
   const people = new Map<number, Person>();
   people.set(ownerId, { name: settings.owner_name || "Владелец", username: settings.owner_username || null });
   for (const u of users) {
-    if (u.role === "admin" || u.role === "viewer") people.set(u.id, { name: u.name, username: u.username });
+    if (u.role === "owner" || u.role === "admin" || u.role === "viewer") people.set(u.id, { name: u.name, username: u.username });
   }
   return people;
 }

@@ -14,6 +14,7 @@ import {
   getSentKeys,
   getSetting,
   getSettings,
+  listOwnerIds,
   listPayments,
   listPeople,
   type Payment,
@@ -96,14 +97,16 @@ function describe(err: unknown): string {
 
 /** Сообщение владельцу о сбое — не чаще одного раза в день. */
 export async function alertOwner(env: Env, api: Api, text: string, now = new Date()): Promise<void> {
-  const { ownerId, timeZone } = getConfig(env);
+  const { ownerIds, timeZone } = getConfig(env);
   const today = localNow(now, timeZone).date;
   try {
     if ((await getSetting(env.DB, "alert_sent")) === today) return;
-    await api.sendMessage(ownerId, text, NO_PREVIEW);
     await setSetting(env.DB, "alert_sent", today);
+    for (const id of await listOwnerIds(env.DB, ownerIds)) {
+      await api.sendMessage(id, text, NO_PREVIEW).catch((err) => console.error("Владелец недоступен", err));
+    }
   } catch (err) {
-    console.error("Не удалось предупредить владельца о сбое", err);
+    console.error("Не удалось предупредить владельцев о сбое", err);
   }
 }
 
@@ -120,7 +123,7 @@ export async function sendCsv(db: D1Database, api: Api, chatId: number, stamp: I
 }
 
 export async function runCheck(env: Env, api: Api, opts: { force?: boolean; now?: Date } = {}): Promise<CheckResult> {
-  const { ownerId, timeZone } = getConfig(env);
+  const { ownerId, ownerIds, timeZone } = getConfig(env);
   const db = env.DB;
   const now = opts.now ?? new Date();
   const { date: today, hour } = localNow(now, timeZone);
@@ -231,10 +234,13 @@ export async function runCheck(env: Env, api: Api, opts: { force?: boolean; now?
       } catch (err) {
         console.error("Не удалось отправить недельную сводку", err);
       }
-      try {
-        await sendCsv(db, api, ownerId, today, "💾 Еженедельная резервная копия. ");
-      } catch (err) {
-        console.error("Не удалось отправить резервную копию", err);
+      // Резервная копия — каждому владельцу: если один потеряет аккаунт, данные останутся у других.
+      for (const id of await listOwnerIds(db, ownerIds)) {
+        try {
+          await sendCsv(db, api, id, today, "💾 Еженедельная резервная копия. ");
+        } catch (err) {
+          console.error("Не удалось отправить резервную копию", err);
+        }
       }
     }
   }

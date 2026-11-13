@@ -86,14 +86,106 @@ describe("доступ", () => {
     expect(paymentRow(id)).toMatchObject({ due_date: "2026-11-20", deleted: 0 });
   });
 
-  it("админ не может менять настройки и доступ", async () => {
+  it("админ: настройки доступны, раздел «Доступ» — нет", async () => {
+    await h.send(ADMIN, "/start");
+    const menu = h.sent("sendMessage", ADMIN)[0]!.payload.reply_markup.keyboard.flat().map((b: { text: string }) => b.text);
+    expect(menu).toEqual(["📋 Список", "➕ Добавить", "✏️ Изменить", "❓ Помощь", "⚙️ Настройки"]);
+
+    await h.send(ADMIN, "⚙️ Настройки");
+    expect(h.lastText()).toContain("⚙️ Настройки\nПредупреждать за: 4 дн.");
     await h.click(ADMIN, "s:days:7");
-    await h.click(ADMIN, `u:set:${VIEWER}:admin`);
+    await h.click(ADMIN, "s:hour:9");
     await h.click(ADMIN, "s:csv");
+    expect(setting("warn_days")).toBe("7");
+    expect(setting("check_hour")).toBe("9");
+    expect(h.sent("sendDocument", ADMIN)).toHaveLength(2);
+
+    h.reset();
+    await h.send(ADMIN, "👥 Доступ");
+    expect(h.lastText()).toBe("Нет доступа");
+    await h.click(ADMIN, "u:list");
+    await h.click(ADMIN, `u:set:${VIEWER}:admin`);
+    await h.click(ADMIN, `u:set:${ADMIN}:owner`);
     expect(h.alerts()).toEqual(["Нет доступа", "Нет доступа", "Нет доступа"]);
+    expect(h.sql("SELECT id, role FROM users ORDER BY id")).toEqual([
+      { id: ADMIN, role: "admin" },
+      { id: VIEWER, role: "viewer" },
+    ]);
+  });
+
+  it("наблюдатель не может менять настройки", async () => {
+    await h.send(VIEWER, "⚙️ Настройки");
+    expect(h.lastText()).toBe("Нет доступа");
+    await h.click(VIEWER, "s:days:7");
+    await h.click(VIEWER, "s:unbind");
+    expect(h.alerts()).toEqual(["Нет доступа", "Нет доступа"]);
     expect(setting("warn_days")).toBe("4");
-    expect(h.sql("SELECT role FROM users WHERE id = ?", VIEWER)[0]!.role).toBe("viewer");
-    expect(h.sent("sendDocument")).toEqual([]);
+  });
+
+  it("владелец назначает второго владельца — после подтверждения", async () => {
+    await h.click(OWNER, `u:own:${ADMIN}`);
+    expect(h.lastText()).toContain("Точно сделать владельцем: Сеня?");
+    expect(h.sql("SELECT role FROM users WHERE id = ?", ADMIN)[0]!.role).toBe("admin");
+
+    await h.click(OWNER, `u:set:${ADMIN}:owner`);
+    expect(h.sql("SELECT role FROM users WHERE id = ?", ADMIN)[0]!.role).toBe("owner");
+    const welcome = h.sent("sendMessage", ADMIN).at(-1)!.payload;
+    expect(welcome.text).toContain("Ваша роль: владелец.");
+    expect(welcome.reply_markup.keyboard.flat().map((b: { text: string }) => b.text)).toContain("👥 Доступ");
+  });
+
+  it("второй владелец управляет доступом, но не трогает главного, себя и других владельцев", async () => {
+    const SECOND = 2010;
+    h.sql("INSERT INTO users (id, name, role) VALUES (?, 'Влад', 'owner')", SECOND);
+    h.sql("UPDATE users SET role = 'owner' WHERE id = ?", ADMIN);
+
+    await h.send(SECOND, "👥 Доступ");
+    expect(h.lastText()).toContain("👥 Доступ");
+    await h.click(SECOND, `u:set:${VIEWER}:admin`);
+    expect(h.sql("SELECT role FROM users WHERE id = ?", VIEWER)[0]!.role).toBe("admin");
+
+    await h.click(SECOND, `u:revoke:${OWNER}`); // главный владелец
+    await h.click(SECOND, `u:revoke:${SECOND}`); // сам себя
+    await h.click(SECOND, `u:set:${ADMIN}:viewer`); // другой владелец
+    expect(h.alerts().slice(-3)).toEqual([
+      "Главного владельца изменить нельзя.",
+      "Свою роль изменить нельзя.",
+      "Роль совладельца меняет только главный владелец.",
+    ]);
+    expect(h.sql("SELECT id, role FROM users WHERE role = 'owner' ORDER BY id")).toEqual([
+      { id: ADMIN, role: "owner" },
+      { id: SECOND, role: "owner" },
+    ]);
+
+    // Главный владелец может понизить совладельца.
+    await h.click(OWNER, `u:set:${SECOND}:admin`);
+    expect(h.sql("SELECT role FROM users WHERE id = ?", SECOND)[0]!.role).toBe("admin");
+  });
+
+  it("запрос доступа приходит всем владельцам; второй раз его не обработать", async () => {
+    h.sql("UPDATE users SET role = 'owner' WHERE id = ?", ADMIN);
+    await h.send(STRANGER, "/start", { name: "Макс" });
+    expect(h.sent("sendMessage", OWNER)).toHaveLength(1);
+    expect(h.sent("sendMessage", ADMIN)).toHaveLength(1);
+
+    await h.click(ADMIN, `acc:viewer:${STRANGER}`);
+    expect(h.sql("SELECT role FROM users WHERE id = ?", STRANGER)[0]!.role).toBe("viewer");
+    h.reset();
+    await h.click(OWNER, `acc:admin:${STRANGER}`); // кнопка под копией запроса у другого владельца
+    expect(h.alerts()).toEqual(["Этот запрос уже обработан."]);
+    expect(h.sql("SELECT role FROM users WHERE id = ?", STRANGER)[0]!.role).toBe("viewer");
+    expect(h.sent("sendMessage", STRANGER)).toEqual([]);
+  });
+
+  it("несколько главных владельцев в OWNER_ID через запятую", async () => {
+    h.env.OWNER_ID = `${OWNER}, 3001`;
+    const { createBot } = await import("../src/bot");
+    const { getRole } = await import("../src/db");
+    const { getConfig } = await import("../src/config");
+    const config = getConfig(h.env);
+    expect(config).toMatchObject({ ownerId: OWNER, ownerIds: [OWNER, 3001] });
+    expect(await getRole(h.env.DB, config.ownerIds, 3001)).toBe("owner");
+    expect(createBot(h.env)).toBeDefined();
   });
 
   it("смена роли действует сразу; забранный доступ блокирует", async () => {
@@ -468,11 +560,15 @@ describe("группа", () => {
     expect(setting("group_chat_id")).toBe("-100999");
   });
 
-  it("владелец упоминает бота в теме — напоминания идут туда; чужое упоминание не действует", async () => {
+  it("владелец или админ упоминает бота в теме — напоминания идут туда; упоминание наблюдателя не действует", async () => {
     bindGroup();
     const inTopic = { is_topic_message: true, message_thread_id: 77 };
-    await h.send(ADMIN, `@${BOT_USERNAME}`, { chat: groupChat, extra: inTopic });
+    await h.send(VIEWER, `@${BOT_USERNAME}`, { chat: groupChat, extra: inTopic });
+    await h.send(STRANGER, `@${BOT_USERNAME}`, { chat: groupChat, extra: inTopic });
     expect(setting("group_thread_id")).toBeUndefined();
+
+    await h.send(ADMIN, `@${BOT_USERNAME}`, { chat: groupChat, extra: { is_topic_message: true, message_thread_id: 55 } });
+    expect(setting("group_thread_id")).toBe("55");
 
     await h.send(OWNER, `@${BOT_USERNAME} пиши сюда`, { chat: groupChat, extra: inTopic });
     expect(setting("group_thread_id")).toBe("77");

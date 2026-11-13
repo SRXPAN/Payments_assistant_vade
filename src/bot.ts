@@ -20,6 +20,7 @@ import {
   getState,
   getUser,
   getWarnDays,
+  listOwnerIds,
   listPayments,
   listPeople,
   listTrash,
@@ -102,8 +103,9 @@ export function menuKeyboard(role: Role): Keyboard {
   if (role === "viewer") {
     kb.text(MENU.list).text(MENU.help);
   } else {
-    kb.text(MENU.list).text(MENU.add).row().text(MENU.edit).text(MENU.help);
-    if (role === "owner") kb.row().text(MENU.access).text(MENU.settings);
+    kb.text(MENU.list).text(MENU.add).row().text(MENU.edit).text(MENU.help).row();
+    if (role === "owner") kb.text(MENU.access);
+    kb.text(MENU.settings);
   }
   return kb.resized().persistent();
 }
@@ -112,8 +114,8 @@ export function menuKeyboard(role: Role): Keyboard {
 function allowed(role: Role | null, item: string): boolean {
   if (!role) return false;
   if (item === MENU.list || item === MENU.help) return true;
-  if (item === MENU.add || item === MENU.edit) return role !== "viewer";
-  return role === "owner";
+  if (item === MENU.access) return role === "owner";
+  return role !== "viewer"; // добавление, изменение и настройки — владельцам и админам
 }
 
 const canEdit = (role: Role | null) => role === "owner" || role === "admin";
@@ -145,8 +147,10 @@ const dayOf = (iso: string) => Number(iso.slice(8, 10));
 const monthDays = (a: number, b: number) => `${Math.min(a, b)},${Math.max(a, b)}`;
 
 export function createBot(env: Env): Bot {
-  const { ownerId, timeZone } = getConfig(env);
+  const { ownerId, ownerIds, timeZone } = getConfig(env);
   const db = env.DB;
+  /** Роль читается из базы на каждом действии, поэтому смена роли действует сразу. */
+  const roleOf = (userId: number) => getRole(db, ownerIds, userId);
   const bot = new Bot(env.BOT_TOKEN, {
     // Ожидается JSON из /setup; всё остальное игнорируем, тогда grammY сам спросит getMe.
     botInfo: env.BOT_INFO?.trim().startsWith("{") ? JSON.parse(env.BOT_INFO) : undefined,
@@ -196,7 +200,7 @@ export function createBot(env: Env): Bot {
   }
 
   /** Роль и справка под неё — приходит человеку при выдаче или смене доступа. */
-  async function welcome(userId: number, role: "admin" | "viewer", intro: string): Promise<void> {
+  async function welcome(userId: number, role: Role, intro: string): Promise<void> {
     await bot.api.sendMessage(userId, `${intro}\n\n${helpText(role, await getWarnDays(db))}`, {
       reply_markup: menuKeyboard(role),
       ...NO_PREVIEW,
@@ -218,13 +222,15 @@ export function createBot(env: Env): Bot {
     }
   }
 
-  /** Владелец узнаёт о важных действиях админов: удаление платежа, ручная смена срока. */
+  /** Владельцы узнают о важных действиях админов: удаление платежа, ручная смена срока, отвязка группы. */
   async function notifyOwner(actor: Actor, text: string): Promise<void> {
-    if (actor.id === ownerId) return;
-    try {
-      await bot.api.sendMessage(ownerId, `🔔 ${text}`, NO_PREVIEW);
-    } catch (err) {
-      console.error("Не удалось уведомить владельца", err);
+    if ((await roleOf(actor.id)) === "owner") return; // о действиях самих владельцев не сообщаем
+    for (const id of await listOwnerIds(db, ownerIds)) {
+      try {
+        await bot.api.sendMessage(id, `🔔 ${text}`, NO_PREVIEW);
+      } catch (err) {
+        console.error("Не удалось уведомить владельца", err);
+      }
     }
   }
 
@@ -232,11 +238,12 @@ export function createBot(env: Env): Bot {
 
   dm.command("start", async (ctx) => {
     const from = ctx.from;
-    const role = await getRole(db, ownerId, from.id);
+    const role = await roleOf(from.id);
     if (role) {
       await clearState(db, ctx.chat.id, from.id);
-      if (role === "owner") {
-        // Имя владельца нужно, чтобы назначать его ответственным и упоминать в напоминаниях.
+      if (from.id === ownerId) {
+        // Имя главного владельца нужно, чтобы назначать его ответственным и упоминать в напоминаниях
+        // (совладельцы есть в таблице пользователей, их имена берутся оттуда).
         await setSetting(db, "owner_name", from.first_name);
         await setSetting(db, "owner_username", from.username ?? "");
       }
@@ -260,17 +267,20 @@ export function createBot(env: Env): Bot {
       .text("Админ", `acc:admin:${from.id}`)
       .text("Наблюдатель", `acc:viewer:${from.id}`)
       .text("Отклонить", `acc:deny:${from.id}`);
-    try {
-      await ctx.api.sendMessage(ownerId, `${displayName(from)} просит доступ`, { reply_markup: kb });
-    } catch (err) {
-      // Владелец ещё не нажал /start у бота — запрос останется в базе.
-      console.error("Не удалось отправить запрос владельцу", err);
+    // Запрос получают все владельцы; решить может любой из них.
+    for (const id of await listOwnerIds(db, ownerIds)) {
+      try {
+        await ctx.api.sendMessage(id, `${displayName(from)} просит доступ`, { reply_markup: kb });
+      } catch (err) {
+        // Этот владелец ещё не нажал /start у бота — запрос останется в базе и виден в «👥 Доступ».
+        console.error("Не удалось отправить запрос владельцу", err);
+      }
     }
   });
 
   // Решение владельца по запросу доступа.
   bot.callbackQuery(/^acc:(admin|viewer|deny):(\d+)$/, async (ctx) => {
-    if (ctx.from.id !== ownerId) {
+    if ((await roleOf(ctx.from.id)) !== "owner") {
       await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
       return;
     }
@@ -279,6 +289,12 @@ export function createBot(env: Env): Bot {
     const user = await getUser(db, userId);
     if (!user) {
       await ctx.answerCallbackQuery({ text: "Пользователь не найден" });
+      return;
+    }
+    if (user.role !== "pending") {
+      // Запрос уже обработал другой владелец (или роль сменили в «👥 Доступ»).
+      await ctx.answerCallbackQuery({ text: "Этот запрос уже обработан." });
+      await ctx.editMessageText(`${displayName(user)}: запрос уже обработан. Изменить роль — «👥 Доступ».`).catch(() => {});
       return;
     }
     await setUserRole(db, userId, action === "deny" ? "rejected" : action);
@@ -301,7 +317,7 @@ export function createBot(env: Env): Bot {
 
   dm.hears(Object.values(MENU), async (ctx) => {
     const item = ctx.message.text ?? "";
-    const role = await getRole(db, ownerId, ctx.from.id);
+    const role = await roleOf(ctx.from.id);
     if (!role || !allowed(role, item)) {
       await ctx.reply(
         NO_ACCESS,
@@ -340,7 +356,7 @@ export function createBot(env: Env): Bot {
   // ---------- Список по категориям: доступно всем, у кого есть роль ----------
 
   bot.callbackQuery(/^l:(cats|all|cat)(?::(\w+))?$/, async (ctx) => {
-    if (!(await getRole(db, ownerId, ctx.from.id))) {
+    if (!(await roleOf(ctx.from.id))) {
       await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
       return;
     }
@@ -356,11 +372,19 @@ export function createBot(env: Env): Bot {
     }
   });
 
-  // ---------- «👥 Доступ» и «⚙️ Настройки»: только владелец, проверка на каждом нажатии ----------
+  // ---------- «👥 Доступ»: только владельцы; «⚙️ Настройки»: владельцы и админы ----------
+  // Права проверяются на каждом нажатии.
 
   const ownerOnly = bot.on("callback_query:data").filter(async (ctx) => {
-    if (!/^[su]:/.test(ctx.callbackQuery.data)) return false;
-    if (ctx.from.id === ownerId) return true;
+    if (!ctx.callbackQuery.data.startsWith("u:")) return false;
+    if ((await roleOf(ctx.from.id)) === "owner") return true;
+    await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
+    return false;
+  });
+
+  const settingsAccess = bot.on("callback_query:data").filter(async (ctx) => {
+    if (!ctx.callbackQuery.data.startsWith("s:")) return false;
+    if (canEdit(await roleOf(ctx.from.id))) return true;
     await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
     return false;
   });
@@ -370,13 +394,14 @@ export function createBot(env: Env): Bot {
     await show(ctx, accessListView(await listUsers(db)));
   });
 
-  ownerOnly.callbackQuery(/^u:(open|set|revoke|forget):(\d+)(?::(admin|viewer))?$/, async (ctx) => {
+  ownerOnly.callbackQuery(/^u:(open|own|set|revoke|forget):(\d+)(?::(owner|admin|viewer))?$/, async (ctx) => {
     const action = ctx.match[1];
     const userId = Number(ctx.match[2]);
-    const user = userId === ownerId ? null : await getUser(db, userId);
+    const isMain = ownerIds.includes(ctx.from.id);
+    const user = ownerIds.includes(userId) ? null : await getUser(db, userId);
     if (!user) {
       await ctx.answerCallbackQuery({
-        text: userId === ownerId ? "Владельца изменить нельзя." : "Этого человека уже нет в списке.",
+        text: ownerIds.includes(userId) ? "Главного владельца изменить нельзя." : "Этого человека уже нет в списке.",
       });
       await show(ctx, accessListView(await listUsers(db)));
       return;
@@ -384,15 +409,35 @@ export function createBot(env: Env): Bot {
 
     if (action === "open") {
       await ctx.answerCallbackQuery();
-      await show(ctx, userCardView(user));
+      await show(ctx, userCardView(user, "", { manageOwner: isMain, self: userId === ctx.from.id }));
+      return;
+    }
+    // Совладелец не меняет свою роль и роли других совладельцев — это может только главный владелец.
+    if (userId === ctx.from.id || (user.role === "owner" && !isMain)) {
+      await ctx.answerCallbackQuery({
+        text: userId === ctx.from.id ? "Свою роль изменить нельзя." : "Роль совладельца меняет только главный владелец.",
+        show_alert: true,
+      });
       return;
     }
 
-    const role = ctx.match[3] as "admin" | "viewer" | undefined;
+    if (action === "own") {
+      await ctx.answerCallbackQuery();
+      await show(ctx, {
+        text: `Точно сделать владельцем: ${user.name}?\nОн сможет выдавать и забирать доступ, назначать других владельцев и менять все настройки.`,
+        keyboard: new InlineKeyboard().text("Да", `u:set:${userId}:owner`).text("Нет", `u:open:${userId}`),
+      });
+      return;
+    }
+
+    const role = ctx.match[3] as "owner" | "admin" | "viewer" | undefined;
     if (action === "set" && role) {
       await setUserRole(db, userId, role);
       await ctx.answerCallbackQuery({ text: "Роль изменена" });
-      await show(ctx, userCardView({ ...user, role }, `✅ ${user.name} теперь ${ROLE_LABELS[role]}`));
+      await show(
+        ctx,
+        userCardView({ ...user, role }, `✅ ${user.name} теперь ${ROLE_LABELS[role]}`, { manageOwner: isMain }),
+      );
       // Новая роль действует сразу; человеку приходит уведомление, справка и подходящее меню.
       await welcome(userId, role, `Ваша роль: ${ROLE_LABELS[role]}.`).catch((err) =>
         console.error("Не удалось сообщить о смене роли", err),
@@ -430,7 +475,7 @@ export function createBot(env: Env): Bot {
     await ctx.answerCallbackQuery();
   });
 
-  ownerOnly.callbackQuery(/^s:(days|hour):(\d+)$/, async (ctx) => {
+  settingsAccess.callbackQuery(/^s:(days|hour):(\d+)$/, async (ctx) => {
     const value = Number(ctx.match[2]);
     const isDays = ctx.match[1] === "days";
     if (!(isDays ? WARN_CHOICES : HOUR_CHOICES).includes(value)) {
@@ -443,46 +488,50 @@ export function createBot(env: Env): Bot {
   });
 
   // Не беспокоить в выходные и праздники (по умолчанию включено).
-  ownerOnly.callbackQuery("s:quiet", async (ctx) => {
+  settingsAccess.callbackQuery("s:quiet", async (ctx) => {
     const quiet = (await getSetting(db, "quiet_weekends")) !== "0";
     await setSetting(db, "quiet_weekends", quiet ? "0" : "1");
     await ctx.answerCallbackQuery({ text: "Сохранено" });
     await show(ctx, settingsView(await getSettings(db)));
   });
 
-  ownerOnly.callbackQuery("s:notopic", async (ctx) => {
+  settingsAccess.callbackQuery("s:notopic", async (ctx) => {
     await deleteSetting(db, "group_thread_id");
     await ctx.answerCallbackQuery({ text: "Тема сброшена" });
     await show(ctx, settingsView(await getSettings(db), "Напоминания будут приходить в общий чат группы."));
   });
 
-  ownerOnly.callbackQuery("s:unbind", async (ctx) => {
+  settingsAccess.callbackQuery("s:unbind", async (ctx) => {
     const group = await getSetting(db, "group_chat_id");
     for (const key of ["group_chat_id", "group_title", "group_thread_id"]) await deleteSetting(db, key);
     await ctx.answerCallbackQuery({ text: "Группа отвязана" });
     await show(ctx, settingsView(await getSettings(db), "Группа отвязана — напоминания будут приходить вам в личку."));
-    // Бот выходит из группы; чтобы привязать снова, добавьте его заново.
+    // Бот выходит из группы; чтобы привязать снова, владелец добавляет его заново.
     if (group) await ctx.api.leaveChat(Number(group)).catch(() => {});
+    await notifyOwner(
+      { id: ctx.from.id, name: ctx.from.first_name },
+      `${ctx.from.first_name} отвязал рабочую группу — напоминания теперь приходят главному владельцу в личку.`,
+    );
   });
 
-  ownerOnly.callbackQuery("s:csv", async (ctx) => {
+  settingsAccess.callbackQuery("s:csv", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Готовлю файлы…" });
     await sendCsv(db, bot.api, ctx.from.id, today());
   });
 
-  ownerOnly.callbackQuery(/^s:(trash|back)$/, async (ctx) => {
+  settingsAccess.callbackQuery(/^s:(trash|back)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     await show(ctx, ctx.match[1] === "trash" ? trashView(await listTrash(db)) : settingsView(await getSettings(db)));
   });
 
-  ownerOnly.callbackQuery(/^s:restore:(\d+)$/, async (ctx) => {
+  settingsAccess.callbackQuery(/^s:restore:(\d+)$/, async (ctx) => {
     const item = await restorePayment(db, Number(ctx.match[1]), { id: ctx.from.id, name: ctx.from.first_name });
     await ctx.answerCallbackQuery({ text: item ? "Восстановлено" : "Этого платежа в корзине уже нет." });
     const note = item ? `♻️ Восстановлено: ${item.name} — до ${formatDate(item.due_date)}` : "";
     await show(ctx, trashView(await listTrash(db), note));
   });
 
-  ownerOnly.callbackQuery("s:test", async (ctx) => {
+  settingsAccess.callbackQuery("s:test", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Проверяю…" });
     const result = await runCheck(env, bot.api, { force: true });
     const where = result.toGroup ? "в группу" : "вам в личку";
@@ -513,7 +562,8 @@ export function createBot(env: Env): Bot {
     }
     if (isBound || inChat(update.old_chat_member.status)) return; // уже были здесь, сменились только права
 
-    if (chat.type === "channel" || update.from.id !== ownerId) {
+    // Привязать группу может любой владелец; остальным бот не доверяет и выходит.
+    if (chat.type === "channel" || (await roleOf(update.from.id)) !== "owner") {
       await ctx.leaveChat().catch((err) => console.error("Не удалось выйти из чата", err));
       return;
     }
@@ -537,8 +587,8 @@ export function createBot(env: Env): Bot {
     const actor: Actor = { id: ctx.from.id, name: ctx.from.first_name };
     const thread = threadOf(ctx.message);
 
-    // Владелец упомянул бота: напоминания будут приходить в тему, где написано это сообщение.
-    if (actor.id === ownerId && ctx.message.text.includes(`@${ctx.me.username}`)) {
+    // Владелец или админ упомянул бота: напоминания будут приходить в тему, где написано это сообщение.
+    if (ctx.message.text.includes(`@${ctx.me.username}`) && canEdit(await roleOf(actor.id))) {
       if ((await getSetting(db, "group_chat_id")) !== String(chatId)) return;
       if (thread.message_thread_id) {
         await setSetting(db, "group_thread_id", String(thread.message_thread_id));
@@ -557,7 +607,7 @@ export function createBot(env: Env): Bot {
     if (fsm?.state !== "edit:date" || fsm.data.promptId !== replyTo) return;
 
     const p = fsm.data.id ? await getPayment(db, fsm.data.id) : null;
-    if (!p || !canEdit(await getRole(db, ownerId, actor.id))) {
+    if (!p || !canEdit(await roleOf(actor.id))) {
       await clearState(db, chatId, actor.id);
       if (!p) await ctx.reply("Платёж не найден — возможно, его уже оплатили или удалили.", thread);
       return;
@@ -593,7 +643,7 @@ export function createBot(env: Env): Bot {
   dm.on("message:text", async (ctx) => {
     const chatId = ctx.chat.id;
     const actor: Actor = { id: ctx.from.id, name: ctx.from.first_name };
-    const role = await getRole(db, ownerId, actor.id);
+    const role = await roleOf(actor.id);
     if (!role) {
       await ctx.reply("Нет доступа. Нажмите /start, чтобы отправить запрос владельцу.");
       return;
@@ -749,7 +799,7 @@ export function createBot(env: Env): Bot {
 
   const work = bot.on("callback_query:data").filter(async (ctx) => {
     if (!/^[aepr]:/.test(ctx.callbackQuery.data)) return false;
-    if (canEdit(await getRole(db, ownerId, ctx.from.id))) return true;
+    if (canEdit(await roleOf(ctx.from.id))) return true;
     await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
     return false;
   });
